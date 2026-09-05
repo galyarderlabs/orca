@@ -83,6 +83,20 @@ jobs:
             fi
             TAG="$UPSTREAM_TAG"
             TITLE="Orca $TAG"
+
+            echo "Merging latest upstream release ($TAG) into current tree..."
+            MERGE_TARGET="$TAG"
+            if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+              MERGE_TARGET="upstream/main"
+            fi
+            if ! git merge --no-edit "$MERGE_TARGET"; then
+              echo "Standard merge had conflicts, retrying with recursive -X ours strategy..."
+              git merge --abort || true
+              git merge -X ours --no-edit "$MERGE_TARGET" || {
+                echo "Error: Unresolvable merge conflict encountered."
+                exit 1
+              }
+            fi
           fi
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
