@@ -1,0 +1,150 @@
+name: Build Desktop (Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: 'Build target'
+        required: true
+        type: choice
+        options:
+          - 'latest-release'
+          - 'latest-commit'
+          - 'custom-ref'
+        default: 'latest-release'
+      custom_ref:
+        description: 'Tag name or commit SHA (only used if build_target is custom-ref)'
+        required: false
+        default: ''
+      release_tag:
+        description: 'Explicit Release Tag override (optional)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 4 * * *' # Daily at 04:00 UTC
+  push:
+    paths:
+      - '.github/workflows/build-desktop.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux .deb & .AppImage (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Release Metadata & Sync Upstream (if Nightly)
+        id: meta
+        run: |
+          set -euo pipefail
+          TARGET="${{ inputs.build_target || (github.event_name == 'schedule' && 'latest-commit' || 'latest-release') }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/stablyai/orca.git 2>/dev/null || true
+          git fetch --force upstream main --tags --prune
+
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+            TITLE="Orca $TAG"
+          elif [ "$TARGET" = "custom-ref" ] && [ -n "${{ inputs.custom_ref }}" ]; then
+            REF="${{ inputs.custom_ref }}"
+            TAG="$REF"
+            TITLE="Orca $TAG"
+          elif [ "$TARGET" = "latest-commit" ]; then
+            echo "Merging latest upstream commits from stablyai/orca:main..."
+            if ! git merge --no-edit upstream/main; then
+              echo "Standard merge had conflicts, retrying with recursive -X ours strategy..."
+              git merge --abort || true
+              git merge -X ours --no-edit upstream/main || {
+                echo "Error: Unresolvable merge conflict encountered."
+                exit 1
+              }
+            fi
+
+            UPSTREAM_SHA=$(git rev-parse upstream/main)
+            SHORT_SHA="${UPSTREAM_SHA:0:7}"
+            DATE_STR=$(date -u +'%Y.%m.%d')
+            TAG="nightly-${DATE_STR}-${SHORT_SHA}"
+            TITLE="Orca Nightly (${DATE_STR} - ${SHORT_SHA})"
+          else
+            LATEST_UPSTREAM_TAG=$(git describe --tags $(git rev-list --tags --max-count=1 upstream/main) 2>/dev/null || echo "v1.4.197")
+            TAG="$LATEST_UPSTREAM_TAG"
+            TITLE="Orca $TAG"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "Target: $TARGET | Release Tag: $TAG | Title: $TITLE"
+
+      - name: Check if Release Already Exists
+        id: check_release
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTS=$(gh release view "${{ steps.meta.outputs.tag }}" --repo "${{ github.repository }}" --json tagName -q .tagName 2>/dev/null || echo "")
+          if [ -n "$EXISTS" ]; then
+            echo "Release ${{ steps.meta.outputs.tag }} already exists. Skipping build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Linux computer-use provider & packaging dependencies
+        if: steps.check_release.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-atspi-2.0 at-spi2-core xclip xdotool rpm cpio
+
+      - name: Setup Node & dependencies
+        if: steps.check_release.outputs.skip != 'true'
+        uses: ./.github/actions/install-node-dependencies
+        with:
+          native-runtime: electron
+
+      - name: Build app
+        if: steps.check_release.outputs.skip != 'true'
+        run: pnpm build:release
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+
+      - name: Package Linux Desktop (.deb & .AppImage)
+        if: steps.check_release.outputs.skip != 'true'
+        run: |
+          node config/scripts/ensure-native-runtime.mjs --runtime=electron
+          pnpm exec electron-builder --config config/electron-builder.config.cjs --linux AppImage deb --x64 --publish never
+
+      - name: Prepare Release Artifacts
+        if: steps.check_release.outputs.skip != 'true'
+        id: prepare_assets
+        run: |
+          mkdir -p dist-release
+          find dist/ -maxdepth 1 -name "*.deb" -exec cp {} dist-release/ \; 2>/dev/null || true
+          find dist/ -maxdepth 1 -name "*.AppImage" -exec cp {} dist-release/ \; 2>/dev/null || true
+          ls -la dist-release/
+
+      - name: Publish or Update GitHub Release
+        if: steps.check_release.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          TITLE: ${{ steps.meta.outputs.title }}
+        run: |
+          echo "Publishing release $TAG ($TITLE) to ${{ github.repository }}..."
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" dist-release/* \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --notes "$TITLE — Orca Linux Desktop with native MacTahoe macOS-style window controls (.deb & .AppImage)"
+          else
+            gh release upload "$TAG" dist-release/* --repo "${{ github.repository }}" --clobber
+          fi
