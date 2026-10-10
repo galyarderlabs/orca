@@ -129,6 +129,11 @@ jobs:
         with:
           native-runtime: electron
 
+      - name: Install mobile dependencies
+        if: steps.check_release.outputs.skip != 'true'
+        working-directory: mobile
+        run: pnpm install --frozen-lockfile
+
       - name: Build app
         if: steps.check_release.outputs.skip != 'true'
         run: pnpm build:release
